@@ -284,7 +284,7 @@ func renderHandler(w http.ResponseWriter, r *http.Request, stats *renderStats) {
 		format = "png"
 	}
 
-	cacheTimeout := int32(60)
+	cacheTimeout := int32(10)
 
 	if tstr := r.FormValue("cacheTimeout"); tstr != "" {
 		t, err := strconv.Atoi(tstr)
