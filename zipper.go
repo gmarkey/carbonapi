@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/ioutil"
@@ -9,7 +10,8 @@ import (
 	"strconv"
 
 	"github.com/dgryski/carbonapi/expr"
-	pb "github.com/dgryski/carbonzipper/carbonzipperpb"
+	pb "github.com/dgryski/carbonzipper/carbonzipperpb3"
+	"github.com/dgryski/carbonapi/util"
 )
 
 var errNoMetrics = errors.New("no metrics")
@@ -23,24 +25,30 @@ type zipper struct {
 	client *http.Client
 }
 
-func (z zipper) Find(metric string) (pb.GlobResponse, error) {
-
+func (z zipper) Find(ctx context.Context, metric string) (pb.GlobResponse, error) {
 	u, _ := url.Parse(z.z + "/metrics/find/")
 
 	u.RawQuery = url.Values{
 		"query":  []string{metric},
-		"format": []string{"protobuf"},
+		"format": []string{"protobuf3"},
 	}.Encode()
 
 	var pbresp pb.GlobResponse
 
-	err := z.get("Find", u, &pbresp)
+	err := z.get(ctx, "Find", u, &pbresp)
 
 	return pbresp, err
 }
 
-func (z zipper) get(who string, u *url.URL, msg unmarshaler) error {
-	resp, err := z.client.Get(u.String())
+func (z zipper) get(ctx context.Context, who string, u *url.URL, msg unmarshaler) error {
+	request, err := http.NewRequest("GET", u.String(), nil)
+	if err != nil {
+		return fmt.Errorf("http.NewRequest: %+v", err)
+	}
+
+	request = util.MarshalCtx(ctx, request)
+
+	resp, err := z.client.Do(request.WithContext(ctx))
 	if err != nil {
 		return fmt.Errorf("http.Get: %+v", err)
 	}
@@ -59,11 +67,17 @@ func (z zipper) get(who string, u *url.URL, msg unmarshaler) error {
 	return nil
 }
 
-func (z zipper) Passthrough(metric string) ([]byte, error) {
+func (z zipper) Passthrough(ctx context.Context, metric string) ([]byte, error) {
 
 	u, _ := url.Parse(z.z + metric)
 
-	resp, err := z.client.Get(u.String())
+	request, err := http.NewRequest("GET", u.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("http.NewRequest: %+v", err)
+	}
+	request = util.MarshalCtx(ctx, request)
+
+	resp, err := z.client.Do(request.WithContext(ctx))
 	if err != nil {
 		return nil, fmt.Errorf("http.Get: %+v", err)
 	}
@@ -77,28 +91,31 @@ func (z zipper) Passthrough(metric string) ([]byte, error) {
 	return body, nil
 }
 
-func (z zipper) Render(metric string, from, until int32) (expr.MetricData, error) {
+func (z zipper) Render(ctx context.Context, metric string, from, until int32) ([]*expr.MetricData, error) {
+	var result []*expr.MetricData
 
 	u, _ := url.Parse(z.z + "/render/")
 
 	u.RawQuery = url.Values{
 		"target": []string{metric},
-		"format": []string{"protobuf"},
+		"format": []string{"protobuf3"},
 		"from":   []string{strconv.Itoa(int(from))},
 		"until":  []string{strconv.Itoa(int(until))},
 	}.Encode()
 
 	var pbresp pb.MultiFetchResponse
-	err := z.get("Render", u, &pbresp)
+	err := z.get(ctx, "Render", u, &pbresp)
 	if err != nil {
-		return expr.MetricData{}, err
+		return result, err
 	}
 
 	if m := pbresp.Metrics; len(m) == 0 {
-		return expr.MetricData{}, errNoMetrics
+		return result, errNoMetrics
 	}
 
-	mdata := expr.MetricData{FetchResponse: *pbresp.Metrics[0]}
+	for i := range pbresp.Metrics {
+		result = append(result, &expr.MetricData{FetchResponse: *pbresp.Metrics[i]})
+	}
 
-	return mdata, nil
+	return result, nil
 }

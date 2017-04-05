@@ -104,8 +104,8 @@ aliasByMetric(seriesList)                                                 |  0.9
 aliasByNode(seriesList, *nodes)                                           |  0.9.14 | Supported
 aliasSub(seriesList, search, replace)                                     |  0.9.10 | Supported
 alpha(seriesList, alpha)                                                  |  0.9.10 | Supported
-applyByNode(seriesList, nodeNum, templateFunction, newName=None)          |  latest |
-areaBetween(seriesList)                                                   |  0.9.14 |
+applyByNode(seriesList, nodeNum, templateFunction, newName=None)          |  latest | Supported
+areaBetween(seriesList)                                                   |  0.9.14 | Supported
 asPercent(seriesList, total=None)                                         |  0.9.10 | Supported
 averageAbove(seriesList, n)                                               |  0.9.9  | Supported
 averageBelow(seriesList, n)                                               |  0.9.9  | Supported
@@ -130,6 +130,7 @@ drawAsInfinite(seriesList)                                                |  0.9
 events(*tags)                                                             |  0.9.9  |
 exclude(seriesList, pattern)                                              |  0.9.9  | Supported
 fallbackSeries( seriesList, fallback )                                    |  0.9.14 |
+[fft](https://en.wikipedia.org/wiki/Fast_Fourier_transform)(absSeriesList, phaseSeriesList)                                       |  not in graphite | Experimental
 grep(seriesList, pattern)                                                 |  0.9.14 | Supported
 group(*seriesLists)                                                       |  0.9.10 | Supported
 groupByNode(seriesList, nodeNum, callback)                                |  0.9.9  | Supported
@@ -138,25 +139,27 @@ highestAverage(seriesList, n)                                             |  0.9
 highestCurrent(seriesList, n)                                             |  0.9.9  | Supported
 highestMax(seriesList, n)                                                 |  0.9.9  | Supported
 hitcount(seriesList, intervalString, alignToInterval=False)               |  0.9.10 | Supported
-holtWintersAberration(seriesList, delta=3)                                |  0.9.10 | [#66](https://github.com/dgryski/carbonapi/issues/66)
+holtWintersAberration(seriesList, delta=3)                                |  0.9.10 | Supported
 holtWintersConfidenceArea(seriesList, delta=3)                            |  0.9.10 | [#66](https://github.com/dgryski/carbonapi/issues/66)
-holtWintersConfidenceBands(seriesList, delta=3)                           |  0.9.10 | [#66](https://github.com/dgryski/carbonapi/issues/66)
-holtWintersForecast(seriesList)                                           |  0.9.10 | Supported - but see: [#66](https://github.com/dgryski/carbonapi/issues/66)
+holtWintersConfidenceBands(seriesList, delta=3)                           |  0.9.10 | Supported
+holtWintersForecast(seriesList)                                           |  0.9.10 | Supported
 identity(name)                                                            |  0.9.14 |
+[ifft](https://en.wikipedia.org/wiki/Fast_Fourier_transform)(absSeriesList, phaseSeriesList)                                      |  not in graphite | Experimental
 integral(seriesList)                                                      |  0.9.9  | Supported
 integralByInterval(seriesList, intervalUnit)                              |  latest |
 invert(seriesList)                                                        |  0.9.14 | Supported
 isNonNull(seriesList)                                                     |  0.9.11 | Supported (also isNotNull alias)
 keepLastValue(seriesList, limit=inf)                                      |  0.9.14 | Supported
-kolmogorovSmirnovTest2(series, series, windowSize) alias ksTest2()        |  not in graphite | Experimental
-legendValue(seriesList, *valueTypes)                                      |  0.9.10 |
+[kolmogorovSmirnovTest2](https://en.wikipedia.org/wiki/Kolmogorov%E2%80%93Smirnov_test)(series, series, windowSize) alias ksTest2()        |  not in graphite | Experimental
+legendValue(seriesList, *valueTypes)                                      |  0.9.10 | Supported
 limit(seriesList, n)                                                      |  0.9.9  | Supported
-lineWidth(seriesList, width)                                              |  0.9.9  |
+lineWidth(seriesList, width)                                              |  0.9.9  | Supported
 linearRegression(seriesList, startSourceAt=None, endSourceAt=None)        |  latest |
 linearRegressionAnalysis(series)                                          |  latest |
 logarithm(seriesList, base=10), alias log()                               |  0.9.10 | Supported
 lowestAverage(seriesList, n)                                              |  0.9.9  | Supported
 lowestCurrent(seriesList, n)                                              |  0.9.9  | Supported
+[lowPass](https://en.wikipedia.org/wiki/Low-pass_filter)(seriesList, cutPercent)                                           |  not in graphite | Experimental
 mapSeries(seriesList, mapNode), Short form: map()                         |  0.9.14 |
 maxSeries(*seriesLists)                                                   |  0.9.9  | Supported
 maximumAbove(seriesList, n)                                               |  0.9.9  | Supported
@@ -173,15 +176,16 @@ nPercentile(seriesList, n)                                                |  0.9
 nonNegativeDerivative(seriesList, maxValue=None)                          |  0.9.9  | Supported
 offset(seriesList, factor)                                                |  0.9.9  | Supported
 offsetToZero(seriesList)                                                  |  0.9.11 | Supported
-pearson(series, series, n)                                                |  not in graphite | Experimental
+[pearson](https://en.wikipedia.org/wiki/Pearson_product-moment_correlation_coefficient)(series, series, n)                                                |  not in graphite | Experimental
 pearsonClosest(series, seriesList, windowSize, direction="abs")           |  not in graphite | Experimental
 perSecond(seriesList, maxValue=None)                                      |  0.9.14 | Supported
 percentileOfSeries(seriesList, n, interpolate=False)                      |  0.9.10 | Supported
+[polyfit](https://en.wikipedia.org/wiki/Polynomial_regression)(seriesList, degree=1, offset='0d')                                |  not in graphite | Experimental
 pow(seriesList, factor)                                                   |  0.9.14 | Supported
 randomWalkFunction(name, step=60), Short Alias: randomWalk()              |  0.9.9  | Supported
 rangeOfSeries(*seriesLists)                                               |  0.9.10 | Supported
 reduceSeries(seriesLists, reduceFunction, reduceNode, *reduceMatchers)    |  0.9.14 |
-+ reduce() Short form of reduceSeries()                                   |  - - -  |
+reduce()                                                                  |  - - -  | Short form of reduceSeries()
 removeAbovePercentile(seriesList, n)                                      |  0.9.10 | Supported
 removeAboveValue(seriesList, n)                                           |  0.9.10 | Supported
 removeBelowPercentile(seriesList, n)                                      |  0.9.10 | Supported
@@ -211,8 +215,8 @@ timeFunction(name, step=60), Short Alias: time()                          |  0.9
 timeShift(seriesList, timeShift, resetEnd=True)                           |  0.9.11 | Supported
 timeSlice(seriesList, startSliceAt, endSliceAt='now')                     |  0.9.14 |
 timeStack(seriesList, timeShiftUnit, timeShiftStart, timeShiftEnd)        |  0.9.14 | Supported
-tukeyAbove(seriesList, basis, n, interval=0)                              |  not in graphite | Experimental
-tukeyBelow(seriesList, basis, n, interval=0)                              |  not in graphite | Experimental
+[tukeyAbove](https://en.wikipedia.org/wiki/Tukey%27s_range_test)(seriesList, basis, n, interval=0)                              |  not in graphite | Experimental
+[tukeyBelow](https://en.wikipedia.org/wiki/Tukey%27s_range_test)(seriesList, basis, n, interval=0)                              |  not in graphite | Experimental
 transformNull(seriesList, default=0)                                      |  0.9.10 | Supported
 useSeriesAbove(seriesList, value, search, replace)                        |  0.9.10 |
 weightedAverage(seriesListAvg, seriesListWeight, node)                    |  0.9.14 |

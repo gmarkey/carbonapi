@@ -2,11 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"expvar"
 	"flag"
 	"fmt"
+	"io/ioutil"
+	"log"
 	"net/http"
 	_ "net/http/pprof"
 	"net/url"
@@ -16,63 +19,72 @@ import (
 	"strings"
 	"time"
 
+	"gopkg.in/yaml.v2"
+
 	"github.com/dgryski/carbonapi/expr"
-	pb "github.com/dgryski/carbonzipper/carbonzipperpb"
-	"github.com/dgryski/carbonzipper/mlog"
+	"github.com/dgryski/carbonapi/util"
+	"github.com/dgryski/carbonzipper/cache"
+	pb "github.com/dgryski/carbonzipper/carbonzipperpb3"
 	"github.com/dgryski/carbonzipper/mstats"
 
-	"github.com/bradfitz/gomemcache/memcache"
-	ecache "github.com/dgryski/go-expirecache"
 	"github.com/facebookgo/grace/gracehttp"
 	"github.com/facebookgo/pidfile"
 	"github.com/gorilla/handlers"
 	"github.com/peterbourgon/g2g"
+
+	"github.com/lomik/zapwriter"
+	"github.com/satori/go.uuid"
+	"go.uber.org/zap"
 )
 
 // Metrics contains exported counters and values for graphite
 var Metrics = struct {
-	Requests         *expvar.Int
-	RequestCacheHits *expvar.Int
+	Requests              *expvar.Int
+	RenderRequests        *expvar.Int
+	RequestCacheHits      *expvar.Int
+	RequestCacheMisses    *expvar.Int
+	RenderCacheOverheadNS *expvar.Int
 
-	FindRequests  *expvar.Int
-	FindCacheHits *expvar.Int
+	FindRequests        *expvar.Int
+	FindCacheHits       *expvar.Int
+	FindCacheMisses     *expvar.Int
+	FindCacheOverheadNS *expvar.Int
 
-	RenderRequests *expvar.Int
-
-	MemcacheTimeouts *expvar.Int
+	MemcacheTimeouts expvar.Func
 
 	CacheSize  expvar.Func
 	CacheItems expvar.Func
 }{
-	Requests:         expvar.NewInt("requests"),
-	RequestCacheHits: expvar.NewInt("request_cache_hits"),
+	Requests: expvar.NewInt("requests"),
+	// TODO: request_cache -> render_cache
+	RenderRequests:        expvar.NewInt("render_requests"),
+	RequestCacheHits:      expvar.NewInt("request_cache_hits"),
+	RequestCacheMisses:    expvar.NewInt("request_cache_misses"),
+	RenderCacheOverheadNS: expvar.NewInt("render_cache_overhead_ns"),
 
-	FindRequests:  expvar.NewInt("find_requests"),
-	FindCacheHits: expvar.NewInt("find_cache_hits"),
-
-	RenderRequests: expvar.NewInt("render_requests"),
-
-	MemcacheTimeouts: expvar.NewInt("memcache_timeouts"),
+	FindRequests:        expvar.NewInt("find_requests"),
+	FindCacheHits:       expvar.NewInt("find_cache_hits"),
+	FindCacheMisses:     expvar.NewInt("find_cache_misses"),
+	FindCacheOverheadNS: expvar.NewInt("find_cache_overhead_ns"),
 }
 
 // BuildVersion is provided to be overridden at build time. Eg. go build -ldflags -X 'main.BuildVersion=...'
 var BuildVersion = "(development build)"
 
-var queryCache bytesCache
-var findCache bytesCache
-
-var defaultTimeZone = time.Local
-
-var logger mlog.Level
-
-// Zipper is API entry to carbonzipper
-var Zipper zipper
-
-// Limiter limits concurrent zipper requests
-var Limiter limiter
-
 // for testing
 var timeNow = time.Now
+
+func splitRemoteAddr(addr string) (string, string) {
+	tmp := strings.Split(addr, ":")
+	if len(tmp) < 1 {
+		return "unknown", "unknown"
+	}
+	if len(tmp) == 1 {
+		return tmp[0], ""
+	}
+
+	return tmp[0], tmp[1]
+}
 
 func writeResponse(w http.ResponseWriter, b []byte, format string, jsonp string) {
 
@@ -119,10 +131,6 @@ const (
 	contentTypeCSV        = "text/csv"
 	contentTypeSVG        = "image/svg+xml"
 )
-
-type renderStats struct {
-	zipperRequests int
-}
 
 func buildParseErrorString(target, e string, err error) string {
 	msg := fmt.Sprintf("%s\n\n%-20s: %s\n", http.StatusText(http.StatusBadRequest), "Target", target)
@@ -173,7 +181,7 @@ func parseTime(s string) (hour, minute int, err error) {
 var timeFormats = []string{"20060102", "01/02/06"}
 
 // dateParamToEpoch turns a passed string parameter into a unix epoch
-func dateParamToEpoch(s string, d int64) int32 {
+func dateParamToEpoch(s string, qtz string, d int64) int32 {
 
 	if s == "" {
 		// return the default if nothing was passed
@@ -196,7 +204,7 @@ func dateParamToEpoch(s string, d int64) int32 {
 	case "midnight", "noon", "teatime":
 		yy, mm, dd := timeNow().Date()
 		hh, min, _ := parseTime(s) // error ignored, we know it's valid
-		dt := time.Date(yy, mm, dd, hh, min, 0, 0, defaultTimeZone)
+		dt := time.Date(yy, mm, dd, hh, min, 0, 0, Config.defaultTimeZone)
 		return int32(dt.Unix())
 	}
 
@@ -220,6 +228,13 @@ func dateParamToEpoch(s string, d int64) int32 {
 		return int32(d)
 	}
 
+	var tz = Config.defaultTimeZone
+	if qtz != "" {
+		if z, err := time.LoadLocation(qtz); err != nil {
+			tz = z
+		}
+	}
+
 	var t time.Time
 dateStringSwitch:
 	switch ds {
@@ -232,7 +247,7 @@ dateStringSwitch:
 		t = timeNow().AddDate(0, 0, 1)
 	default:
 		for _, format := range timeFormats {
-			t, err = time.ParseInLocation(format, ds, defaultTimeZone)
+			t, err = time.ParseInLocation(format, ds, tz)
 			if err == nil {
 				break dateStringSwitch
 			}
@@ -248,18 +263,47 @@ dateStringSwitch:
 	}
 
 	yy, mm, dd := t.Date()
-	t = time.Date(yy, mm, dd, hour, minute, 0, 0, defaultTimeZone)
+	t = time.Date(yy, mm, dd, hour, minute, 0, 0, Config.defaultTimeZone)
 
 	return int32(t.Unix())
 }
 
-func renderHandler(w http.ResponseWriter, r *http.Request, stats *renderStats) {
+func renderHandler(w http.ResponseWriter, r *http.Request) {
+	t0 := time.Now()
+	uuid := uuid.NewV4()
+	// TODO: Migrate to context.WithTimeout
+	// ctx, _ := context.WithTimeout(context.TODO(), Config.ZipperTimeout)
+	ctx := util.SetUUID(context.Background(), uuid.String())
+	username, _, _ := r.BasicAuth()
+	logger := zapwriter.Logger("render").With(
+		zap.String("carbonapi_uuid", uuid.String()),
+		zap.String("username", username),
+	)
+
+	srcIp, srcPort := splitRemoteAddr(r.RemoteAddr)
+	accessLogger := zapwriter.Logger("access").With(
+		zap.String("handler", "render"),
+		zap.String("carbonapi_uuid", uuid.String()),
+		zap.String("username", username),
+		zap.String("url", r.URL.RequestURI()),
+		zap.String("peer_ip", srcIp),
+		zap.String("peer_port", srcPort),
+		zap.String("host", r.Host),
+		zap.String("referer", r.Referer()),
+	)
+
+	size := 0
+	zipperRequests := 0
 
 	Metrics.Requests.Add(1)
 
 	err := r.ParseForm()
 	if err != nil {
 		http.Error(w, http.StatusText(http.StatusBadRequest)+": "+err.Error(), http.StatusBadRequest)
+		accessLogger.Error("request failed",
+			zap.Duration("runtime", time.Since(t0)),
+			zap.Int("http_code", http.StatusBadRequest),
+		)
 		return
 	}
 
@@ -289,7 +333,10 @@ func renderHandler(w http.ResponseWriter, r *http.Request, stats *renderStats) {
 	if tstr := r.FormValue("cacheTimeout"); tstr != "" {
 		t, err := strconv.Atoi(tstr)
 		if err != nil {
-			logger.Logf("failed to parse cacheTimeout: %v: %v", tstr, err)
+			logger.Error("failed to parse cacheTimeout",
+				zap.String("cache_string", tstr),
+				zap.Error(err),
+			)
 		} else {
 			cacheTimeout = int32(t)
 		}
@@ -308,25 +355,58 @@ func renderHandler(w http.ResponseWriter, r *http.Request, stats *renderStats) {
 
 	cacheKey := r.Form.Encode()
 
-	if response, ok := queryCache.get(cacheKey); useCache && ok {
+	// normalize from and until values
+	qtz := r.FormValue("tz")
+	from32 := dateParamToEpoch(from, qtz, timeNow().Add(-24*time.Hour).Unix())
+	until32 := dateParamToEpoch(until, qtz, timeNow().Unix())
+
+	accessLogger = accessLogger.With(
+		zap.String("format", format),
+		zap.Bool("use_cache", useCache),
+		zap.Strings("targets", targets),
+		zap.String("from_raw", from),
+		zap.String("until_raw", until),
+		zap.Int32("from", from32),
+		zap.Int32("until", until32),
+		zap.String("tz", qtz),
+		zap.Int32("cache_timeout", cacheTimeout),
+	)
+
+	tc := time.Now()
+	if response, err := Config.queryCache.Get(cacheKey); useCache && err != nil {
+		td := time.Since(tc).Nanoseconds()
+		Metrics.RenderCacheOverheadNS.Add(td)
 		Metrics.RequestCacheHits.Add(1)
 		writeResponse(w, response, format, jsonp)
+		accessLogger.Info("request served",
+			zap.Bool("from_cache", true),
+			zap.Duration("runtime", time.Since(t0)),
+			zap.Int("http_code", http.StatusOK),
+			zap.Int("carbonzipper_response_size_bytes", 0),
+			zap.Int("carbonapi_response_size_bytes", len(response)),
+		)
 		return
 	}
+	td := time.Since(tc).Nanoseconds()
+	Metrics.RenderCacheOverheadNS.Add(td)
+	Metrics.RequestCacheMisses.Add(1)
 
-	// normalize from and until values
-	// BUG(dgryski): doesn't handle timezones the same as graphite-web
-	from32 := dateParamToEpoch(from, timeNow().Add(-24*time.Hour).Unix())
-	until32 := dateParamToEpoch(until, timeNow().Unix())
 	if from32 == until32 {
 		http.Error(w, "Invalid empty time range", http.StatusBadRequest)
+		accessLogger.Error("request failed",
+			zap.String("reason", "Invalid empty time range"),
+			zap.Duration("runtime", time.Since(t0)),
+			zap.Int("http_code", http.StatusBadRequest),
+		)
 		return
 	}
 
 	var results []*expr.MetricData
-	var errors []string
+	errors := make(map[string]string)
 	metricMap := make(map[expr.MetricRequest][]*expr.MetricData)
+	fatalError := false
 
+	var metrics []string
 	for _, target := range targets {
 
 		exp, e, err := expr.ParseExpr(target)
@@ -334,11 +414,16 @@ func renderHandler(w http.ResponseWriter, r *http.Request, stats *renderStats) {
 		if err != nil || e != "" {
 			msg := buildParseErrorString(target, e, err)
 			http.Error(w, msg, http.StatusBadRequest)
+			accessLogger.Error("request failed",
+				zap.String("reason", msg),
+				zap.Duration("runtime", time.Since(t0)),
+				zap.Int("http_code", http.StatusBadRequest),
+			)
 			return
 		}
 
 		for _, m := range exp.Metrics() {
-
+			metrics = append(metrics, m.Metric)
 			mfetch := m
 			mfetch.From += from32
 			mfetch.Until += until32
@@ -350,84 +435,133 @@ func renderHandler(w http.ResponseWriter, r *http.Request, stats *renderStats) {
 
 			var glob pb.GlobResponse
 			var haveCacheData bool
+			if !Config.SendGlobsAsIs {
+				tc := time.Now()
+				if response, err := Config.findCache.Get(m.Metric); useCache && err != nil {
+					Metrics.FindCacheOverheadNS.Add(td)
+					Metrics.FindCacheHits.Add(1)
+					err := glob.Unmarshal(response)
+					haveCacheData = err == nil
 
-			if response, ok := findCache.get(m.Metric); useCache && ok {
-				Metrics.FindCacheHits.Add(1)
-				err := glob.Unmarshal(response)
-				haveCacheData = err == nil
-			}
+				}
+				td := time.Since(tc).Nanoseconds()
+				Metrics.FindCacheOverheadNS.Add(td)
 
-			if !haveCacheData {
-				var err error
-				Metrics.FindRequests.Add(1)
-				stats.zipperRequests++
-				glob, err = Zipper.Find(m.Metric)
-				if err != nil {
-					logger.Logf("Find: %v: %v", m.Metric, err)
-					continue
-				}
-				b, err := glob.Marshal()
-				if err == nil {
-					findCache.set(m.Metric, b, 5*60)
-				}
-			}
-
-			// For each metric returned in the Find response, query Render
-			// This is a conscious decision to *not* cache render data
-			rch := make(chan *expr.MetricData, len(glob.GetMatches()))
-			leaves := 0
-			for _, m := range glob.GetMatches() {
-				if !m.GetIsLeaf() {
-					continue
-				}
-				Metrics.RenderRequests.Add(1)
-				leaves++
-				Limiter.enter()
-				stats.zipperRequests++
-				go func(m *pb.GlobMatch, from, until int32) {
-					var rptr *expr.MetricData
-					r, err := Zipper.Render(m.GetPath(), from, until)
-					if err == nil {
-						rptr = &r
-					} else {
-						logger.Logf("Render: %v: %v", m.GetPath(), err)
+				if !haveCacheData {
+					Metrics.FindCacheMisses.Add(1)
+					var err error
+					Metrics.FindRequests.Add(1)
+					zipperRequests++
+					glob, err = Config.zipper.Find(ctx, m.Metric)
+					if err != nil {
+						logger.Error("find error",
+							zap.String("metric", m.Metric),
+							zap.Error(err),
+						)
+						continue
 					}
-					rch <- rptr
-					Limiter.leave()
-				}(m, mfetch.From, mfetch.Until)
-			}
+					b, err := glob.Marshal()
+					if err == nil {
+						tc := time.Now()
+						Config.findCache.Set(m.Metric, b, 5*60)
+						td := time.Since(tc).Nanoseconds()
+						Metrics.FindCacheOverheadNS.Add(td)
+					}
+				}
 
-			for i := 0; i < leaves; i++ {
-				r := <-rch
-				if r != nil {
-					metricMap[mfetch] = append(metricMap[mfetch], r)
+				// For each metric returned in the Find response, query Render
+				// This is a conscious decision to *not* cache render data
+				rch := make(chan *expr.MetricData, len(glob.GetMatches()))
+				leaves := 0
+				for _, m := range glob.GetMatches() {
+					if !m.GetIsLeaf() {
+						continue
+					}
+					Metrics.RenderRequests.Add(1)
+					leaves++
+					Config.limiter.enter()
+					zipperRequests++
+					go func(m *pb.GlobMatch, from, until int32) {
+						var rptr *expr.MetricData
+						r, err := Config.zipper.Render(ctx, m.GetPath(), from, until)
+						if err == nil {
+							rptr = r[0]
+							size += rptr.Size()
+						} else {
+							logger.Error("render error",
+								zap.String("target", m.GetPath()),
+								zap.Error(err),
+							)
+						}
+						rch <- rptr
+						Config.limiter.leave()
+					}(m, mfetch.From, mfetch.Until)
+				}
+
+				for i := 0; i < leaves; i++ {
+					r := <-rch
+					if r != nil {
+						metricMap[mfetch] = append(metricMap[mfetch], r)
+					}
+				}
+			} else {
+
+				// For each metric returned in the Find response, query Render
+				Metrics.RenderRequests.Add(1)
+				Config.limiter.enter()
+				zipperRequests++
+
+				r, err := Config.zipper.Render(ctx, m.Metric, mfetch.From, mfetch.Until)
+				if err != nil {
+					errors[target] = err.Error()
+					Config.limiter.leave()
+					continue
+				} else {
+					metricMap[mfetch] = r
+				}
+				Config.limiter.leave()
+				for i := range r {
+					size += r[i].Size()
 				}
 			}
 
 			expr.SortMetrics(metricMap[mfetch], mfetch)
-
 		}
 
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
-					var buf [1024]byte
-					runtime.Stack(buf[:], false)
-					logger.Logf("panic during eval: %s: %s\n%s\n", cacheKey, r, string(buf[:]))
+					logger.Error("panic during eval:",
+						zap.String("cache_key", cacheKey),
+						zap.Stack("stack"),
+					)
 				}
 			}()
 			exprs, err := expr.EvalExpr(exp, from32, until32, metricMap)
 			if err != nil && err != expr.ErrSeriesDoesNotExist {
-				errors = append(errors, target+": "+err.Error())
+				errors[target] = err.Error()
+				fatalError = true
 				return
 			}
 			results = append(results, exprs...)
 		}()
 	}
 
-	if len(errors) > 0 {
-		errors = append([]string{"Encountered the following errors:"}, errors...)
-		http.Error(w, strings.Join(errors, "\n"), http.StatusBadRequest)
+	accessLogger = accessLogger.With(zap.Strings("metrics", metrics))
+
+	if len(errors) > 0 && fatalError {
+		httpErrors := make([]string, 0, len(errors))
+		httpErrors = append(httpErrors, "Following errors have occured:")
+		for _, e := range errors {
+			httpErrors = append(httpErrors, e)
+		}
+		http.Error(w, strings.Join(httpErrors, "\n"), http.StatusBadRequest)
+		accessLogger.Error("request failed",
+			zap.String("reason", "encoundered multiple errors"),
+			zap.Any("errors", errors),
+			zap.Duration("runtime", time.Since(t0)),
+			zap.Int("http_code", http.StatusBadRequest),
+		)
 		return
 	}
 
@@ -443,6 +577,11 @@ func renderHandler(w http.ResponseWriter, r *http.Request, stats *renderStats) {
 	case "protobuf":
 		body, err = expr.MarshalProtobuf(results)
 		if err != nil {
+			logger.Info("request failed",
+				zap.Int("http_code", http.StatusInternalServerError),
+				zap.String("reason", err.Error()),
+				zap.Duration("runtime", time.Since(t0)),
+			)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -461,19 +600,60 @@ func renderHandler(w http.ResponseWriter, r *http.Request, stats *renderStats) {
 	writeResponse(w, body, format, jsonp)
 
 	if len(results) != 0 {
-		queryCache.set(cacheKey, body, cacheTimeout)
+		tc := time.Now()
+		Config.queryCache.Set(cacheKey, body, cacheTimeout)
+		td := time.Since(tc).Nanoseconds()
+		Metrics.RenderCacheOverheadNS.Add(td)
 	}
+
+	gotErrors := false
+	if len(errors) > 0 {
+		gotErrors = true
+	}
+
+	accessLogger.Info("request served",
+		zap.String("uri", r.RequestURI),
+		zap.Duration("runtime", time.Since(t0)),
+		zap.Int("http_code", http.StatusOK),
+		zap.Bool("have_non_fatal_errors", gotErrors),
+		zap.Any("errors", errors),
+		zap.Int("zipper_requests", zipperRequests),
+		zap.Int("zipper_response_size_bytes", size),
+		zap.Int("carbonapi_response_size_bytes", len(body)),
+	)
 }
 
 func findHandler(w http.ResponseWriter, r *http.Request) {
+	t0 := time.Now()
+	uuid := uuid.NewV4()
+	// TODO: Migrate to context.WithTimeout
+	// ctx, _ := context.WithTimeout(context.TODO(), Config.ZipperTimeout)
+	ctx := util.SetUUID(context.Background(), uuid.String())
+	username, _, _ := r.BasicAuth()
 
 	format := r.FormValue("format")
 	jsonp := r.FormValue("jsonp")
 
 	query := r.FormValue("query")
+	srcIp, srcPort := splitRemoteAddr(r.RemoteAddr)
+	accessLogger := zapwriter.Logger("access").With(
+		zap.String("handler", "find"),
+		zap.String("carbonapi_uuid", uuid.String()),
+		zap.String("username", username),
+		zap.String("url", r.URL.RequestURI()),
+		zap.String("peer_ip", srcIp),
+		zap.String("peer_port", srcPort),
+		zap.String("host", r.Host),
+		zap.String("referer", r.Referer()),
+	)
 
 	if query == "" {
 		http.Error(w, "missing parameter `query`", http.StatusBadRequest)
+		accessLogger.Info("request failed",
+			zap.Int("http_code", http.StatusBadRequest),
+			zap.String("reason", "missing parameter `query`"),
+			zap.Duration("runtime", time.Since(t0)),
+		)
 		return
 	}
 
@@ -481,9 +661,15 @@ func findHandler(w http.ResponseWriter, r *http.Request) {
 		format = "treejson"
 	}
 
-	globs, err := Zipper.Find(query)
+	globs, err := Config.zipper.Find(ctx, query)
 	if err != nil {
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		accessLogger.Info("request failed",
+			zap.String("uri", r.RequestURI),
+			zap.Int("http_code", http.StatusInternalServerError),
+			zap.String("reason", err.Error()),
+			zap.Duration("runtime", time.Since(t0)),
+		)
 		return
 	}
 
@@ -502,10 +688,22 @@ func findHandler(w http.ResponseWriter, r *http.Request) {
 
 	if err != nil {
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		accessLogger.Info("request failed",
+			zap.String("uri", r.RequestURI),
+			zap.Int("http_code", http.StatusInternalServerError),
+			zap.String("reason", err.Error()),
+			zap.Duration("runtime", time.Since(t0)),
+		)
 		return
 	}
 
 	writeResponse(w, b, format, jsonp)
+
+	accessLogger.Info("request served",
+		zap.String("uri", r.RequestURI),
+		zap.Int("http_code", http.StatusOK),
+		zap.Duration("runtime", time.Since(t0)),
+	)
 }
 
 type completer struct {
@@ -622,18 +820,59 @@ func findTreejson(globs pb.GlobResponse) ([]byte, error) {
 }
 
 func passthroughHandler(w http.ResponseWriter, r *http.Request) {
+	t0 := time.Now()
+	uuid := uuid.NewV4()
+	// TODO: Migrate to context.WithTimeout
+	// ctx, _ := context.WithTimeout(context.TODO(), Config.ZipperTimeout)
+	ctx := util.SetUUID(context.Background(), uuid.String())
+	username, _, _ := r.BasicAuth()
+	srcIp, srcPort := splitRemoteAddr(r.RemoteAddr)
+	accessLogger := zapwriter.Logger("access").With(
+		zap.String("username", username),
+		zap.String("handler", "passtrhough"),
+		zap.String("carbonapi_uuid", uuid.String()),
+		zap.String("peer_ip", srcIp),
+		zap.String("peer_port", srcPort),
+		zap.String("host", r.Host),
+		zap.String("referer", r.Referer()),
+	)
 	var data []byte
 	var err error
 
-	if data, err = Zipper.Passthrough(r.URL.RequestURI()); err != nil {
+	if data, err = Config.zipper.Passthrough(ctx, r.URL.RequestURI()); err != nil {
+		accessLogger.Info("request failed",
+			zap.String("uri", r.RequestURI),
+			zap.Duration("runtime", time.Since(t0)),
+			zap.Int("http_code", http.StatusBadRequest),
+		)
 		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 		return
 	}
 	w.Write(data)
+	accessLogger.Info("request served",
+		zap.String("uri", r.RequestURI),
+		zap.Duration("runtime", time.Since(t0)),
+		zap.Int("http_code", http.StatusOK),
+	)
 }
 
 func lbcheckHandler(w http.ResponseWriter, r *http.Request) {
+	t0 := time.Now()
+	accessLogger := zapwriter.Logger("access")
+
 	w.Write([]byte("Ok\n"))
+
+	srcIp, srcPort := splitRemoteAddr(r.RemoteAddr)
+	accessLogger.Info("request served",
+		zap.String("handler", "lbcheck"),
+		zap.String("uri", r.RequestURI),
+		zap.String("peer_ip", srcIp),
+		zap.String("peer_port", srcPort),
+		zap.String("host", r.Host),
+		zap.Duration("runtime", time.Since(t0)),
+		zap.Int("http_code", http.StatusOK),
+		zap.String("referer", r.Referer()),
+	)
 }
 
 var usageMsg = []byte(`
@@ -647,179 +886,284 @@ func usageHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(usageMsg)
 }
 
-func main() {
+var DefaultLoggerConfig = zapwriter.Config{
+	Logger:           "",
+	File:             "stdout",
+	Level:            "info",
+	Encoding:         "console",
+	EncodingTime:     "iso8601",
+	EncodingDuration: "seconds",
+}
 
-	z := flag.String("z", "", "zipper")
-	port := flag.Int("p", 8080, "port")
-	l := flag.Int("l", 20, "concurrency limit")
-	cacheType := flag.String("cache", "mem", "cache type to use")
-	mc := flag.String("mc", "", "comma separated memcached server list")
-	memsize := flag.Int("memsize", 0, "in-memory cache size in MB (0 is unlimited)")
-	cpus := flag.Int("cpus", 0, "number of CPUs to use")
-	tz := flag.String("tz", "", "timezone,offset to use for dates with no timezone")
-	graphiteHost := flag.String("graphite", "", "graphite destination host")
-	logdir := flag.String("logdir", "/var/log/carbonapi/", "logging directory")
-	logtostdout := flag.Bool("stdout", false, "log also to stdout")
-	interval := flag.Duration("i", 60*time.Second, "interval to report internal statistics to graphite")
-	idleconns := flag.Int("idleconns", 10, "max idle connections")
-	pidFile := flag.String("pid", "", "pidfile (default: empty, don't create pidfile)")
+type cacheConfig struct {
+	Type             string   `yaml:"type"`
+	Size             int      `yaml:"size_mb"`
+	MemcachedServers []string `yaml:"memcachedServers"`
+}
+
+type graphiteConfig struct {
+	Host     string
+	Interval time.Duration
+	Prefix   string
+}
+
+var Config = struct {
+	Logger          []zapwriter.Config `yaml:"logger"`
+	ZipperUrl       string             `yaml:"zipper"`
+	Listen          string             `yaml:"listen"`
+	Concurency      int                `yaml:"concurency"`
+	Cache           cacheConfig        `yaml:"cache"`
+	Cpus            int                `yaml:"cpus"`
+	TimezoneString  string             `yaml:"tz"`
+	Graphite        graphiteConfig     `yaml:"graphite"`
+	IdleConnections int                `yaml:"idleConnections"`
+	PidFile         string             `yaml:"pidFile"`
+	SendGlobsAsIs   bool               `yaml:"sendGlobsAsIs"`
+
+	queryCache cache.BytesCache
+	findCache  cache.BytesCache
+
+	defaultTimeZone *time.Location
+
+	// Zipper is API entry to carbonzipper
+	zipper zipper
+
+	// Limiter limits concurrent zipper requests
+	limiter limiter
+}{
+	ZipperUrl:     "http://localhost:8080",
+	Listen:        "[::]:8081",
+	Concurency:    20,
+	SendGlobsAsIs: false,
+	Cache: cacheConfig{
+		Type: "mem",
+	},
+	TimezoneString: "",
+	Graphite: graphiteConfig{
+		Host:     "",
+		Interval: 60 * time.Second,
+		Prefix:   "carbon.api",
+	},
+	Cpus:            0,
+	IdleConnections: 10,
+	PidFile:         "",
+
+	queryCache: cache.NullCache{},
+	findCache:  cache.NullCache{},
+
+	defaultTimeZone: time.Local,
+	Logger:          []zapwriter.Config{DefaultLoggerConfig},
+}
+
+func main() {
+	err := zapwriter.ApplyConfig([]zapwriter.Config{DefaultLoggerConfig})
+	if err != nil {
+		log.Fatal("Failed to initialize logger with default configuration")
+
+	}
+	logger := zapwriter.Logger("main")
+
+	configPath := flag.String("config", "carbonapi.yaml", "Path to the `config file`.")
 
 	flag.Parse()
 
-	if *logdir == "" {
-		mlog.SetRawStream(os.Stdout)
-	} else {
-		mlog.SetOutput(*logdir, "carbonapi", *logtostdout)
+	if *configPath == "" {
+		logger.Fatal("Can't run without a config file")
 	}
+
+	bytes, err := ioutil.ReadFile(*configPath)
+	if err != nil {
+		logger.Fatal("error reading config file",
+			zap.String("config_path", *configPath),
+			zap.Error(err),
+		)
+	}
+
+	err = yaml.Unmarshal(bytes, &Config)
+	if err != nil {
+		logger.Fatal("failed to parse config",
+			zap.String("config_path", *configPath),
+			zap.Error(err),
+		)
+	}
+
+	err = zapwriter.ApplyConfig(Config.Logger)
+	if err != nil {
+		logger.Fatal("failed to initialize logger with requested configuration",
+			zap.Any("configuration", Config.Logger),
+			zap.Error(err),
+		)
+
+	}
+	logger = zapwriter.Logger("main")
 
 	expvar.NewString("BuildVersion").Set(BuildVersion)
-	logger.Logln("starting carbonapi", BuildVersion)
+	expvar.Publish("Config", expvar.Func(func() interface{} { return Config }))
 
-	if p := os.Getenv("PORT"); p != "" {
-		*port, _ = strconv.Atoi(p)
+	Config.limiter = newLimiter(Config.Concurency)
+
+	if _, err := url.Parse(Config.ZipperUrl); err != nil {
+		logger.Fatal("unable to parze zipper", zap.Error(err))
 	}
 
-	Limiter = newLimiter(*l)
-
-	if *z == "" {
-		logger.Fatalln("no zipper provided")
-	}
-
-	if _, err := url.Parse(*z); err != nil {
-		logger.Fatalln("unable to parze zipper:", err)
-	}
-
-	logger.Logln("using zipper", *z)
-	Zipper = zipper{
-		z: *z,
+	Config.zipper = zipper{
+		z: Config.ZipperUrl,
 		client: &http.Client{
 			Transport: &http.Transport{
-				MaxIdleConnsPerHost: *idleconns,
+				MaxIdleConnsPerHost: Config.IdleConnections,
 			},
 		},
 	}
 
-	switch *cacheType {
+	switch Config.Cache.Type {
 	case "memcache":
-		if *mc == "" {
-			logger.Fatalln("memcache cache requested but no memcache servers provided")
+		if len(Config.Cache.MemcachedServers) == 0 {
+			logger.Fatal("memcache cache requested but no memcache servers provided")
 		}
 
-		servers := strings.Split(*mc, ",")
-		logger.Logln("using memcache servers:", servers)
-		queryCache = &memcachedCache{client: memcache.New(servers...)}
-		findCache = &memcachedCache{client: memcache.New(servers...)}
+		logger.Info("memcached configured",
+			zap.Strings("servers", Config.Cache.MemcachedServers),
+		)
+		Config.queryCache = cache.NewMemcached(Config.Cache.MemcachedServers...)
+		// find cache is only used if SendGlobsAsIs is false.
+		if !Config.SendGlobsAsIs {
+			Config.findCache = cache.NewExpireCache(0)
+		}
+
+		mcache := Config.queryCache.(*cache.MemcachedCache)
+
+		Metrics.MemcacheTimeouts = expvar.Func(func() interface{} {
+			return mcache.Timeouts()
+		})
+		expvar.Publish("memcache_timeouts", Metrics.MemcacheTimeouts)
 
 	case "mem":
-		qcache := &expireCache{ec: ecache.New(uint64(*memsize * 1024 * 1024))}
-		queryCache = qcache
-		go queryCache.(*expireCache).ec.ApproximateCleaner(10 * time.Second)
+		Config.queryCache = cache.NewExpireCache(uint64(Config.Cache.Size * 1024 * 1024))
 
-		findCache = &expireCache{ec: ecache.New(0)}
-		go findCache.(*expireCache).ec.ApproximateCleaner(10 * time.Second)
+		// find cache is only used if SendGlobsAsIs is false.
+		if !Config.SendGlobsAsIs {
+			Config.findCache = cache.NewExpireCache(0)
+		}
+
+		qcache := Config.queryCache.(*cache.ExpireCache)
 
 		Metrics.CacheSize = expvar.Func(func() interface{} {
-			return qcache.ec.Size()
+			return qcache.Size()
 		})
 		expvar.Publish("cache_size", Metrics.CacheSize)
 
 		Metrics.CacheItems = expvar.Func(func() interface{} {
-			return qcache.ec.Items()
+			return qcache.Items()
 		})
 		expvar.Publish("cache_items", Metrics.CacheItems)
 
 	case "null":
-		queryCache = &nullCache{}
-		findCache = &nullCache{}
+		// defaults
+		Config.queryCache = cache.NullCache{}
+		Config.findCache = cache.NullCache{}
+	default:
+		logger.Error("Unknown cache type",
+			zap.String("cache_type", Config.Cache.Type),
+			zap.Strings("known_cache_types", []string{"null", "mem", "memcache"}),
+		)
 	}
 
-	if *tz != "" {
-		fields := strings.Split(*tz, ",")
+	if Config.TimezoneString != "" {
+		fields := strings.Split(Config.TimezoneString, ",")
 		if len(fields) != 2 {
-			logger.Fatalf("expected two fields for tz,seconds, got %d", len(fields))
+			logger.Fatal("unexpected amount of fields in tz",
+				zap.Int("fields_got", len(fields)),
+				zap.Int("fields_expected", 2),
+			)
 		}
 
 		var err error
 		offs, err := strconv.Atoi(fields[1])
 		if err != nil {
-			logger.Fatalf("unable to parse seconds: %s: %s", fields[1], err)
+			logger.Fatal("unable to parse seconds",
+				zap.String("field[1]", fields[1]),
+				zap.Error(err),
+			)
 		}
 
-		defaultTimeZone = time.FixedZone(fields[0], offs)
-		logger.Logf("using fixed timezone %s, offset %d ", defaultTimeZone.String(), offs)
+		Config.defaultTimeZone = time.FixedZone(fields[0], offs)
+		logger.Info("using fixed timezone",
+			zap.String("timezone", Config.defaultTimeZone.String()),
+			zap.Int("offset", offs),
+		)
 	}
 
-	if *cpus != 0 {
-		logger.Logln("using GOMAXPROCS", *cpus)
-		runtime.GOMAXPROCS(*cpus)
+	if Config.Cpus != 0 {
+		runtime.GOMAXPROCS(Config.Cpus)
 	}
 
-	if envhost := os.Getenv("GRAPHITEHOST") + ":" + os.Getenv("GRAPHITEPORT"); envhost != ":" || *graphiteHost != "" {
-
-		var host string
-
+	var host string
+	if envhost := os.Getenv("GRAPHITEHOST") + ":" + os.Getenv("GRAPHITEPORT"); envhost != ":" || Config.Graphite.Host != "" {
 		switch {
-		case envhost != ":" && *graphiteHost != "":
-			host = *graphiteHost
+		case envhost != ":" && Config.Graphite.Host != "":
+			host = Config.Graphite.Host
 		case envhost != ":":
 			host = envhost
-		case *graphiteHost != "":
-			host = *graphiteHost
+		case Config.Graphite.Host != "":
+			host = Config.Graphite.Host
 		}
+	}
 
-		logger.Logln("Using graphite host", host)
+	logger.Info("starting carbonapi",
+		zap.String("build_version", BuildVersion),
+		zap.Any("config", Config),
+	)
 
-		logger.Logln("setting stats interval to", *interval)
-
+	if host != "" {
 		// register our metrics with graphite
-		graphite := g2g.NewGraphite(host, *interval, 10*time.Second)
+		graphite := g2g.NewGraphite(host, Config.Graphite.Interval, 10*time.Second)
 
 		hostname, _ := os.Hostname()
 		hostname = strings.Replace(hostname, ".", "_", -1)
 
-		graphite.Register(fmt.Sprintf("carbon.api.%s.requests", hostname), Metrics.Requests)
-		graphite.Register(fmt.Sprintf("carbon.api.%s.request_cache_hits", hostname), Metrics.RequestCacheHits)
+		graphite.Register(fmt.Sprintf("%s.%s.requests", Config.Graphite.Prefix, hostname), Metrics.Requests)
+		graphite.Register(fmt.Sprintf("%s.%s.request_cache_hits", Config.Graphite.Prefix, hostname), Metrics.RequestCacheHits)
+		graphite.Register(fmt.Sprintf("%s.%s.request_cache_misses", Config.Graphite.Prefix, hostname), Metrics.RequestCacheMisses)
+		graphite.Register(fmt.Sprintf("%s.%s.request_cache_overhead_ns", Config.Graphite.Prefix, hostname), Metrics.RenderCacheOverheadNS)
 
-		graphite.Register(fmt.Sprintf("carbon.api.%s.find_requests", hostname), Metrics.FindRequests)
-		graphite.Register(fmt.Sprintf("carbon.api.%s.find_cache_hits", hostname), Metrics.FindCacheHits)
+		graphite.Register(fmt.Sprintf("%s.%s.find_requests", Config.Graphite.Prefix, hostname), Metrics.FindRequests)
+		graphite.Register(fmt.Sprintf("%s.%s.find_cache_hits", Config.Graphite.Prefix, hostname), Metrics.FindCacheHits)
+		graphite.Register(fmt.Sprintf("%s.%s.find_cache_misses", Config.Graphite.Prefix, hostname), Metrics.FindCacheMisses)
+		graphite.Register(fmt.Sprintf("%s.%s.find_cache_overhead_ns", Config.Graphite.Prefix, hostname), Metrics.FindCacheOverheadNS)
 
-		graphite.Register(fmt.Sprintf("carbon.api.%s.render_requests", hostname), Metrics.RenderRequests)
+		graphite.Register(fmt.Sprintf("%s.%s.render_requests", Config.Graphite.Prefix, hostname), Metrics.RenderRequests)
 
-		graphite.Register(fmt.Sprintf("carbon.api.%s.memcache_timeouts", hostname), Metrics.MemcacheTimeouts)
-
-		if Metrics.CacheSize != nil {
-			graphite.Register(fmt.Sprintf("carbon.api.%s.cache_size", hostname), Metrics.CacheSize)
-			graphite.Register(fmt.Sprintf("carbon.api.%s.cache_items", hostname), Metrics.CacheItems)
+		if Metrics.MemcacheTimeouts != nil {
+			graphite.Register(fmt.Sprintf("%s.%s.memcache_timeouts", Config.Graphite.Prefix, hostname), Metrics.MemcacheTimeouts)
 		}
 
-		go mstats.Start(*interval)
+		if Metrics.CacheSize != nil {
+			graphite.Register(fmt.Sprintf("%s.%s.cache_size", Config.Graphite.Prefix, hostname), Metrics.CacheSize)
+			graphite.Register(fmt.Sprintf("%s.%s.cache_items", Config.Graphite.Prefix, hostname), Metrics.CacheItems)
+		}
 
-		graphite.Register(fmt.Sprintf("carbon.api.%s.alloc", hostname), &mstats.Alloc)
-		graphite.Register(fmt.Sprintf("carbon.api.%s.total_alloc", hostname), &mstats.TotalAlloc)
-		graphite.Register(fmt.Sprintf("carbon.api.%s.num_gc", hostname), &mstats.NumGC)
-		graphite.Register(fmt.Sprintf("carbon.api.%s.pause_ns", hostname), &mstats.PauseNS)
+		go mstats.Start(Config.Graphite.Interval)
+
+		graphite.Register(fmt.Sprintf("%s.%s.alloc", Config.Graphite.Prefix, hostname), &mstats.Alloc)
+		graphite.Register(fmt.Sprintf("%s.%s.total_alloc", Config.Graphite.Prefix, hostname), &mstats.TotalAlloc)
+		graphite.Register(fmt.Sprintf("%s.%s.num_gc", Config.Graphite.Prefix, hostname), &mstats.NumGC)
+		graphite.Register(fmt.Sprintf("%s.%s.pause_ns", Config.Graphite.Prefix, hostname), &mstats.PauseNS)
 
 	}
 
-	render := func(w http.ResponseWriter, r *http.Request) {
-		var stats renderStats
-		t0 := time.Now()
-		renderHandler(w, r, &stats)
-		since := time.Since(t0)
-		logger.Logln(r.RequestURI, since.Nanoseconds()/int64(time.Millisecond), stats.zipperRequests)
-	}
-
-	if *pidFile != "" {
-		pidfile.SetPidfilePath(*pidFile)
+	if Config.PidFile != "" {
+		pidfile.SetPidfilePath(Config.PidFile)
 		err := pidfile.Write()
 		if err != nil {
-			logger.Fatalln("error during pidfile.Write():", err)
+			logger.Fatal("error during pidfile.Write()",
+				zap.Error(err),
+			)
 		}
 	}
 
 	r := http.DefaultServeMux
-	r.HandleFunc("/render/", render)
-	r.HandleFunc("/render", render)
+	r.HandleFunc("/render/", renderHandler)
+	r.HandleFunc("/render", renderHandler)
 
 	r.HandleFunc("/metrics/find/", findHandler)
 	r.HandleFunc("/metrics/find", findHandler)
@@ -830,17 +1174,18 @@ func main() {
 	r.HandleFunc("/lb_check", lbcheckHandler)
 	r.HandleFunc("/", usageHandler)
 
-	logger.Logln("listening on port", *port)
 	handler := handlers.CompressHandler(r)
 	handler = handlers.CORS()(handler)
-	handler = handlers.CombinedLoggingHandler(mlog.GetOutput(), handler)
+	handler = handlers.ProxyHeaders(handler)
 
-	err := gracehttp.Serve(&http.Server{
-		Addr:    ":" + strconv.Itoa(*port),
+	err = gracehttp.Serve(&http.Server{
+		Addr:    Config.Listen,
 		Handler: handler,
 	})
 
 	if err != nil {
-		logger.Fatalln(err)
+		logger.Fatal("gracehttp failed",
+			zap.Error(err),
+		)
 	}
 }
